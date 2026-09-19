@@ -1,0 +1,103 @@
+name: Build pte_track.ko (android15-6.6 GKI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_sublevel:
+        description: "内核版本第3段（设备 uname -r 例：6.6.118 -> 118）"
+        required: false
+        default: "118"
+      localversion:
+        description: "LOCALVERSION 后缀（设备 uname -r 去掉 6.6.NNN 后的整段）"
+        required: false
+        default: "-android15-8-g93e223c276e7-abogki-4k"
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      KERNEL_SUBLEVEL: ${{ github.event.inputs.kernel_sublevel || '118' }}
+      KVER_SUFFIX: ${{ github.event.inputs.localversion || '-android15-8-g93e223c276e7-abogki-4k' }}
+
+    steps:
+      - name: Checkout driver source
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            python3 clang lld llvm dwarves zstd kmod
+
+      - name: Clone Android Common Kernel (android15-6.6)
+        run: |
+          git clone --depth 1 -b android15-6.6 \
+            https://github.com/aosp-mirror/kernel_common.git kernel-src \
+          || { rm -rf kernel-src; git clone --depth 1 -b android15-6.6 \
+               https://android.googlesource.com/kernel/common kernel-src; }
+          rm -rf kernel-src/.git
+          du -sh kernel-src
+
+      - name: Pin kernel version + configure GKI
+        run: |
+          cd kernel-src
+          # 1) 固定 SUBLEVEL，与设备 uname -r 完全一致
+          sed -i -E "s/^SUBLEVEL[[:space:]]*=.*/SUBLEVEL = ${KERNEL_SUBLEVEL}/" Makefile
+          grep -E "^(VERSION|PATCHLEVEL|SUBLEVEL) " Makefile
+          # 2) GKI 配置
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          # 3) 清空 defconfig 自带的 LOCALVERSION="-4k"，改为命令行传入完整后缀；
+          #    关掉 LOCALVERSION_AUTO，避免 git 后缀混入版本串
+          sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=""|' .config
+          sed -i 's|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|' .config
+          grep -q '^CONFIG_LOCALVERSION=' .config || echo 'CONFIG_LOCALVERSION=""' >> .config
+          grep -q 'CONFIG_LOCALVERSION_AUTO' .config || echo '# CONFIG_LOCALVERSION_AUTO is not set' >> .config
+          # 4) 关 WERROR 与调试信息（不影响模块 ABI/CRC，缩短构建时间）
+          sed -i 's|^CONFIG_WERROR=y|# CONFIG_WERROR is not set|' .config
+          sed -i 's|^CONFIG_DEBUG_INFO_DWARF5=y|CONFIG_DEBUG_INFO_NONE=y|' .config
+          sed -i 's|^CONFIG_DEBUG_INFO=y|# CONFIG_DEBUG_INFO is not set|' .config
+          sed -i 's|^CONFIG_DEBUG_INFO_BTF=y|# CONFIG_DEBUG_INFO_BTF is not set|' .config
+          sed -i 's|^CONFIG_DEBUG_INFO_BTF_MODULES=y|# CONFIG_DEBUG_INFO_BTF_MODULES is not set|' .config
+          sed -i 's|^CONFIG_DEBUG_INFO_COMPRESSED_ZSTD=y|# CONFIG_DEBUG_INFO_COMPRESSED_ZSTD is not set|' .config
+          rm -f include/config/auto.conf include/config/kernel.release
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          # 5) 断言：kernelrelease 必须等于设备版本串
+          KREL=$(make -s ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease LOCALVERSION="${KVER_SUFFIX}")
+          echo "kernelrelease = $KREL"
+          if [ "$KREL" != "6.6.${KERNEL_SUBLEVEL}${KVER_SUFFIX}" ]; then
+            echo "FATAL: kernelrelease mismatch (check kernel_sublevel / localversion inputs)"
+            exit 1
+          fi
+
+      - name: Build kernel (generates Module.symvers with symbol CRCs)
+        run: |
+          cd kernel-src
+          make -j$(nproc) ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION="${KVER_SUFFIX}"
+          echo "---- kernel.release: $(cat include/config/kernel.release)"
+          ls -l Module.symvers
+
+      - name: Build pte_track.ko
+        run: |
+          make KDIR=kernel-src ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION="${KVER_SUFFIX}"
+          ls -l pte_track.ko
+          EXPECTED="6.6.${KERNEL_SUBLEVEL}${KVER_SUFFIX}"
+          echo "---- modinfo ----"
+          modinfo pte_track.ko | grep -E "^(filename|name|version|vermagic)"
+          modinfo -F vermagic pte_track.ko | grep -F "$EXPECTED" \
+            || { echo "FATAL: vermagic 与设备版本串不匹配"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pte_track-ko
+          path: pte_track.ko
+          if-no-files-found: error
